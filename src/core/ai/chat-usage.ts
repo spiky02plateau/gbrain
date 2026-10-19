@@ -30,7 +30,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { canonicalLookup, priceAtPromptSize } from '../model-pricing.ts';
+import { canonicalLookup, priceAtPromptSize, type ModelPricing } from '../model-pricing.ts';
 import { priceFor, type PricingOverrides } from '../budget/reservation-cost.ts';
 
 export interface ChatUsageRecord {
@@ -113,22 +113,25 @@ export function setChatUsageSink(sink: ChatUsageSink | null): void {
   _sinks = sink ? [{ sink }] : [];
 }
 
+interface ChatTokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
+}
+
 /**
  * Price a chat call in USD from the canonical table. Cache tokens use the
  * table's cache_read/cache_write rates when present, else the input rate
  * (documented best-effort — see module doc). Unknown model → null.
  */
-export function estimateChatCostUsd(
-  model: string,
-  usage: {
-    input_tokens: number;
-    output_tokens: number;
-    cache_read_tokens?: number;
-    cache_write_tokens?: number;
-  },
-): number | null {
+export function estimateChatCostUsd(model: string, usage: ChatTokenUsage): number | null {
   const row = canonicalLookup(model);
-  if (!row) return null;
+  return row ? chatCostUsd(row, usage) : null;
+}
+
+/** USD for one call at a price row, `input_tokens` being the uncached input. */
+function chatCostUsd(row: ModelPricing, usage: ChatTokenUsage): number {
   const cacheRead = usage.cache_read_tokens ?? 0;
   const cacheWrite = usage.cache_write_tokens ?? 0;
   // #6448 item 1: the prompt size that selects a long-prompt tier is the
@@ -168,12 +171,14 @@ export function recordChatUsage(input: {
   if (!sink && !pricedMeter) return;
   try {
     const { input_tokens, output_tokens, cache_read_tokens = 0, cache_write_tokens = 0 } = input.usage;
-    const uncached = Math.max(0, input_tokens - cache_read_tokens - cache_write_tokens);
-    const cost_usd = estimateChatCostUsd(input.model, { ...input.usage, input_tokens: uncached });
+    const uncachedUsage = { ...input.usage, input_tokens: Math.max(0, input_tokens - cache_read_tokens - cache_write_tokens) };
+    const cost_usd = estimateChatCostUsd(input.model, uncachedUsage);
     if (pricedMeter) {
       const price = priceFor(input.model, 'chat', pricedMeter.pricing_overrides);
+      // Table rows (canonical ids and the claude-cli → Anthropic sibling) keep
+      // their cache rates and long-prompt tier; an override is a flat rate.
       const meterCost = price === null ? null
-        : price.source === 'table' && cost_usd !== null ? cost_usd
+        : price.source === 'table' ? chatCostUsd(price.pricing, uncachedUsage)
         : (input_tokens * price.pricing.input + output_tokens * price.pricing.output) / 1_000_000;
       if (meterCost === null) pricedMeter.unpriced_calls = (pricedMeter.unpriced_calls ?? 0) + 1;
       else pricedMeter.cost_usd = (pricedMeter.cost_usd ?? 0) + meterCost;
